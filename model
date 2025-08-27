@@ -1,0 +1,158 @@
+import os
+import torch
+import numpy as np
+from PIL import Image, ImageFilter
+#from IPython.display import display
+#import glob
+from PIL import Image
+#import matplotlib.pyplot as plt
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
+import cv2
+import numpy as np
+from sklearn.model_selection import train_test_split
+from sklearn.svm import SVC
+from sklearn.metrics import accuracy_score
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+
+pathdatset = 'your path to dataset'  # Path to dataset folder containing class subfolders 
+CLASSES = ['good', 'hole','oil spot', 'objects']
+
+
+X = []  # features
+y = []  # labels
+ 
+new_width = 100   
+crop_box = (18, 18, 82, 82) 
+
+# --- Data Loading ---
+for idx, class_name in enumerate(CLASSES):
+    class_folder = os.path.join(pathdatset, class_name)
+    if not os.path.isdir(class_folder):
+        print(f"Warning: {class_folder} missing, skipping.")
+        continue
+
+    # FIX: Iterate through class folder
+    for file in os.listdir(class_folder):
+        if file.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp', '.gif', '.webp')):
+            img_path = os.path.join(class_folder, file)
+            
+            try:
+                img = Image.open(img_path)
+                
+                # Resize
+                width, height = img.size
+                new_height = int(height * new_width / width)
+                img = img.resize((new_width, new_height))
+                
+                # Convert to grayscale
+                img = img.convert('L')
+                
+                # Crop
+                img = img.crop(crop_box)
+                
+                # Blur
+                img = img.filter(ImageFilter.GaussianBlur(radius=1))
+                
+                # Normalize
+                img_array = np.array(img).astype(np.float32) / 255.0
+                
+                # Convert to 3-channel for RGB augmentations
+                img_array = np.stack([img_array]*3, axis=-1)  # Shape (H,W,3)
+                
+                X.append(img_array)
+                y.append(idx)
+                
+            except Exception as e:
+                print(f"Error processing {img_path}: {e}")
+
+X = np.array(X)
+y = np.array(y)
+print(f"Original X shape: {X.shape}")
+
+# ... (keep your data loading code unchanged) ...
+
+# --- Augmentation ---
+transform = A.Compose([
+    A.Rotate(limit=45, p=0.7),
+    A.Affine(shear=20, p=0.5),
+    A.RandomScale(scale_limit=0.2, p=0.5),
+    A.PadIfNeeded(min_height=64, min_width=64, p=1.0),
+    A.RandomCrop(width=64, height=64, p=1.0),  # Critical: Always crop to 64x64
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.5),
+    A.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ToTensorV2()
+])
+
+num_augmented_total = 200   
+x_augmented = []
+y_augmented = []
+
+# --- Data Validation ---
+if len(X) == 0:
+    raise ValueError("No images loaded - check dataset path!")
+
+for i in range(num_augmented_total):
+    try:
+        idx = np.random.randint(0, len(X))
+        original_img = X[idx]
+        
+        augmented = transform(image=original_img)
+        augmented_img = augmented["image"]
+        
+        augmented_img_np = augmented_img.permute(1, 2, 0).cpu().numpy()
+        augmented_img_x = (augmented_img_np * 0.5 + 0.5).clip(0, 1)
+        
+        x_augmented.append(augmented_img_x)
+        y_augmented.append(y[idx])
+        
+    except Exception as e:
+        print(f"Skipping augmentation {i}: {e}")
+
+# --- Final Conversion Fix ---
+target_shape = (64, 64, 3)
+x_augmented_fixed = [img for img in x_augmented if img.shape == target_shape]
+x_augmented = np.array(x_augmented_fixed)
+y_augmented = np.array(y_augmented[:len(x_augmented_fixed)])  # Match lengths
+
+print(f"Augmented X shape: {x_augmented.shape}")
+print(f"Augmented y shape: {y_augmented.shape}")
+
+
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42, stratify=y)
+
+# Combine original and augmented training data
+X_train_combined = np.concatenate([X_train, x_augmented])
+y_train_combined = np.concatenate([y_train, y_augmented])
+
+# Flatten the images/features
+X_train_flat = X_train_combined.reshape(X_train_combined.shape[0], -1)  # (n_samples, flattened_features)
+X_test_flat = X_test.reshape(X_test.shape[0], -1)
+
+# Train SVM on raw pixels (combined training data)
+print(" begin Train SVM classifier")
+clf_raw = SVC(kernel='rbf', random_state=42)
+clf_raw.fit(X_train_flat, y_train_combined)  # Use combined labels
+
+# Predict on raw test data
+y_pred_raw = clf_raw.predict(X_test_flat)
+acc_raw = accuracy_score(y_test, y_pred_raw)
+print(f"Accuracy before feature extraction (raw pixels): {acc_raw:.4f}")
+
+# Apply LDA for feature extraction
+n_classes = len(np.unique(y_train_combined))
+lda = LinearDiscriminantAnalysis(n_components=min(n_classes - 1, 10))
+
+X_train_lda = lda.fit_transform(X_train_flat, y_train_combined)
+X_test_lda = lda.transform(X_test_flat)
+
+# Train SVM on LDA features
+print(" begin Train SVM classifier with lda")
+clf_lda = SVC(kernel='rbf', random_state=42)
+clf_lda.fit(X_train_lda, y_train_combined)
+
+
+y_pred_lda = clf_lda.predict(X_test_lda)
+acc_lda = accuracy_score(y_test, y_pred_lda)
+print(f"Accuracy after feature extraction (LDA features): {acc_lda:.4f}")
